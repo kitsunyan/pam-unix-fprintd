@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <stdio.h>
 
-#include "fprintd_bridge.h"
+#include "fprintd-bridge.h"
 #include "pam_fprintd.h"
 
 #define PROMPT "Password: "

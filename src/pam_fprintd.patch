@@ -1,0 +1,306 @@
+--- a/pam_fprintd.c
++++ b/pam_fprintd.c
+@@ -27,98 +27,18 @@
+ #include <string.h>
+ #include <syslog.h>
+ 
+-#include <glib/gi18n-lib.h>
+ #include <dbus/dbus-glib-bindings.h>
+ #include <dbus/dbus-glib-lowlevel.h>
+ 
+-#define PAM_SM_AUTH
+-#include <security/pam_modules.h>
++#include "pam_fprintd.h"
++#include "fprintd-marshal.h"
+ 
+-#include "marshal.h"
+-
+-#define TR(s) dgettext(GETTEXT_PACKAGE, s)
+-
+-#include "fingerprint-strings.h"
+-
+-#define DEFAULT_MAX_TRIES 3
+-#define DEFAULT_TIMEOUT 30
+-
+-#define MAX_TRIES_MATCH "max-tries="
+-#define TIMEOUT_MATCH "timeout="
+-
+-#define D(pamh, ...) {					\
+-	if (debug) {					\
+-		char *s;				\
+-		s = g_strdup_printf (__VA_ARGS__);	\
+-		send_debug_msg (pamh, s);		\
+-		g_free (s);				\
+-	}						\
+-}
+-
+-
+-static gboolean debug = FALSE;
+-static guint max_tries = DEFAULT_MAX_TRIES;
+-static guint timeout = DEFAULT_TIMEOUT;
+-
+-static gboolean send_info_msg(pam_handle_t *pamh, const char *msg)
+-{
+-	const struct pam_message mymsg = {
+-		.msg_style = PAM_TEXT_INFO,
+-		.msg = msg,
+-	};
+-	const struct pam_message *msgp = &mymsg;
+-	const struct pam_conv *pc;
+-	struct pam_response *resp;
+-	int r;
+-
+-	r = pam_get_item(pamh, PAM_CONV, (const void **) &pc);
+-	if (r != PAM_SUCCESS)
+-		return FALSE;
+-
+-	if (!pc || !pc->conv)
+-		return FALSE;
+-
+-	return (pc->conv(1, &msgp, &resp, pc->appdata_ptr) == PAM_SUCCESS);
+-}
+-
+-static gboolean send_err_msg(pam_handle_t *pamh, const char *msg)
+-{
+-	const struct pam_message mymsg = {
+-		.msg_style = PAM_ERROR_MSG,
+-		.msg = msg,
+-	};
+-	const struct pam_message *msgp = &mymsg;
+-	const struct pam_conv *pc;
+-	struct pam_response *resp;
+-	int r;
+-
+-	r = pam_get_item(pamh, PAM_CONV, (const void **) &pc);
+-	if (r != PAM_SUCCESS)
+-		return FALSE;
+-
+-	if (!pc || !pc->conv)
+-		return FALSE;
+-
+-	return (pc->conv(1, &msgp, &resp, pc->appdata_ptr) == PAM_SUCCESS);
+-}
+-
+-static void send_debug_msg(pam_handle_t *pamh, const char *msg)
+-{
+-	gconstpointer item;
+-	const char *service;
+-
+-	if (pam_get_item(pamh, PAM_SERVICE, &item) != PAM_SUCCESS || !item)
+-		service = "<unknown>";
+-	else
+-		service = item;
+-
+-	openlog (service, LOG_CONS | LOG_PID, LOG_AUTHPRIV);
+-
+-	syslog (LOG_AUTHPRIV|LOG_WARNING, "%s(%s): %s", "pam_fprintd", service, msg);
+-
+-	closelog ();
+-
+-}
++#define D(...)
++#define TR(str) str
++#define finger_str_to_msg(str, ...) g_strdup(str)
++#define verify_result_str_to_msg(str, ...) str
++#define send_err_msg(...)
++#define send_info_msg(...)
+ 
+ static DBusGProxy *create_manager (pam_handle_t *pamh, DBusGConnection **ret_conn, GMainLoop **ret_loop)
+ {
+@@ -223,9 +143,7 @@
+ }
+ 
+ typedef struct {
+-	guint max_tries;
+ 	char *result;
+-	gboolean timed_out;
+ 	gboolean is_swipe;
+ 	pam_handle_t *pamh;
+ 	GMainLoop *loop;
+@@ -261,27 +179,30 @@
+ 	g_free (msg);
+ }
+ 
+-static gboolean verify_timeout_cb (gpointer user_data)
++static gboolean source_callback(gpointer user_data)
+ {
+-	verify_data *data = user_data;
+-
+-	data->timed_out = TRUE;
+-	send_info_msg (data->pamh, "Verification timed out");
+-	g_main_loop_quit (data->loop);
++	fprintd_state *state = user_data;
++	GMainLoop *loop;
+ 
+-	return FALSE;
++	if (state->interrupted)
++	{
++		loop = state->loop;
++		g_main_loop_quit (loop);
++		return G_SOURCE_REMOVE;
++	}
++	return G_SOURCE_CONTINUE;
+ }
+ 
+-static int do_verify(GMainLoop *loop, pam_handle_t *pamh, DBusGProxy *dev, gboolean has_multiple_devices)
++static int do_verify(GMainLoop *loop, pam_handle_t *pamh, DBusGProxy *dev, fprintd_state *state, gboolean has_multiple_devices)
+ {
+ 	GError *error = NULL;
+ 	GHashTable *props;
+ 	DBusGProxy *p;
++	GSource *source;
+ 	verify_data *data;
+ 	int ret;
+ 
+ 	data = g_new0 (verify_data, 1);
+-	data->max_tries = max_tries;
+ 	data->pamh = pamh;
+ 	data->loop = loop;
+ 
+@@ -308,39 +229,30 @@
+ 	dbus_g_proxy_connect_signal(dev, "VerifyFingerSelected", G_CALLBACK(verify_finger_selected),
+ 				    data, NULL);
+ 
+-	ret = PAM_AUTH_ERR;
+-
+-	while (ret == PAM_AUTH_ERR && data->max_tries > 0) {
+-		GSource *source;
++	state->loop = loop;
++	source = g_timeout_source_new (250);
++	g_source_set_callback (source, source_callback, state, NULL);
++	g_source_set_priority (source, G_PRIORITY_DEFAULT);
++	g_source_attach (source, g_main_loop_get_context (loop));
+ 
+-		/* Set up the timeout on our non-default context */
+-		source = g_timeout_source_new_seconds (timeout);
+-		g_source_attach (source, g_main_loop_get_context (loop));
+-		g_source_set_callback (source, verify_timeout_cb, data, NULL);
+-
+-		data->timed_out = FALSE;
++	ret = PAM_AUTH_ERR;
+ 
++	while (ret == PAM_AUTH_ERR) {
+ 		if (!dbus_g_proxy_call (dev, "VerifyStart", &error, G_TYPE_STRING, "any", G_TYPE_INVALID, G_TYPE_INVALID)) {
+ 			if (dbus_g_error_has_name(error, "net.reactivated.Fprint.Error.NoEnrolledPrints"))
+ 				ret = PAM_USER_UNKNOWN;
+ 
+ 			D(pamh, "VerifyStart failed: %s", error->message);
+ 			g_error_free (error);
+-
+-			g_source_destroy (source);
+-			g_source_unref (source);
+ 			break;
+ 		}
+ 
+ 		g_main_loop_run (loop);
+ 
+-		g_source_destroy (source);
+-		g_source_unref (source);
+-
+ 		/* Ignore errors from VerifyStop */
+ 		dbus_g_proxy_call (dev, "VerifyStop", NULL, G_TYPE_INVALID, G_TYPE_INVALID);
+ 
+-		if (data->timed_out) {
++		if (state->interrupted) {
+ 			ret = PAM_AUTHINFO_UNAVAIL;
+ 			break;
+ 		} else {
+@@ -364,12 +276,13 @@
+ 			g_free (data->result);
+ 			data->result = NULL;
+ 		}
+-		data->max_tries--;
+ 	}
+ 
+ 	dbus_g_proxy_disconnect_signal(dev, "VerifyStatus", G_CALLBACK(verify_result), data);
+ 	dbus_g_proxy_disconnect_signal(dev, "VerifyFingerSelected", G_CALLBACK(verify_finger_selected), data);
+ 
++	g_source_destroy (source);
++
+ 	g_free (data->driver);
+ 	g_free (data);
+ 
+@@ -418,7 +331,7 @@
+ 	return TRUE;
+ }
+ 
+-static int do_auth(pam_handle_t *pamh, const char *username)
++static int do_auth(pam_handle_t *pamh, const char *username, fprintd_state *state)
+ {
+ 	DBusGProxy *manager;
+ 	DBusGConnection *connection;
+@@ -445,7 +358,7 @@
+ 
+ 	if (have_prints) {
+ 		if (claim_device (pamh, dev, username)) {
+-			ret = do_verify (loop, pamh, dev, has_multiple_devices);
++			ret = do_verify (loop, pamh, dev, state, has_multiple_devices);
+ 			release_device (pamh, dev);
+ 		}
+ 	}
+@@ -457,17 +370,13 @@
+ 	return ret;
+ }
+ 
+-PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
+-				   const char **argv)
++int pam_sm_authenticate_fprintd(pam_handle_t *pamh, fprintd_state *state)
+ {
+ 	const char *rhost = NULL;
+ 	const char *username;
+ 	guint i;
+ 	int r;
+ 
+-	bindtextdomain (GETTEXT_PACKAGE, LOCALEDIR);
+-	bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
+-
+ #if !GLIB_CHECK_VERSION (2, 36, 0)
+ 	g_type_init();
+ #endif
+@@ -485,41 +394,17 @@
+ 	if (r != PAM_SUCCESS)
+ 		return PAM_AUTHINFO_UNAVAIL;
+ 
+-	for (i = 0; i < argc; i++) {
+-		if (argv[i] != NULL) {
+-			if(g_str_equal (argv[i], "debug")) {
+-				g_message ("debug on");
+-				debug = TRUE;
+-			}
+-			else if (strncmp(argv[i], MAX_TRIES_MATCH, strlen (MAX_TRIES_MATCH)) == 0 && strlen(argv[i]) == strlen (MAX_TRIES_MATCH) + 1) {
+-				max_tries = atoi (argv[i] + strlen (MAX_TRIES_MATCH));
+-				if (max_tries < 1)
+-					max_tries = DEFAULT_MAX_TRIES;
+-				D(pamh, "max_tries specified as: %d", max_tries);
+-			}
+-			else if (strncmp(argv[i], TIMEOUT_MATCH, strlen (TIMEOUT_MATCH)) == 0 && strlen(argv[i]) <= strlen (TIMEOUT_MATCH) + 2) {
+-				timeout = atoi (argv[i] + strlen (TIMEOUT_MATCH));
+-				if (timeout < 10)
+-					timeout = DEFAULT_TIMEOUT;
+-				D(pamh, "timeout specified as: %d", timeout);
+-			}
+-		}
+-	}
+-
+-	r = do_auth(pamh, username);
++	r = do_auth(pamh, username, state);
+ 
+ 	return r;
+ }
+ 
+-PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc,
+-			      const char **argv)
++void fprintd_state_init(fprintd_state *state)
+ {
+-	return PAM_SUCCESS;
++	state->interrupted = 0;
+ }
+ 
+-PAM_EXTERN int pam_sm_chauthtok(pam_handle_t *pamh, int flags, int argc,
+-				const char **argv)
++void fprintd_state_cleanup(fprintd_state *state)
+ {
+-	return PAM_SUCCESS;
++	state->interrupted = 1;
+ }
+-

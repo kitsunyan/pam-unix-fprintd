@@ -1,0 +1,44 @@
+--- a/pam_unix_auth.c
++++ b/pam_unix_auth.c
+@@ -58,6 +58,7 @@
+ #include <security/pam_ext.h>
+ 
+ #include "support.h"
++#include "fprintd-bridge.h"
+ 
+ /*
+  * PAM framework looks for these entry-points to pass control to the
+@@ -102,6 +103,7 @@
+ 	int retval, *ret_data = NULL;
+ 	const char *name;
+ 	const char *p;
++	int should_verify = 1;
+ 
+ 	D(("called."));
+ 
+@@ -155,7 +157,10 @@
+ 	}
+ 	/* get this user's authentication token */
+ 
+-	retval = pam_get_authtok(pamh, PAM_AUTHTOK, &p , NULL);
++	if (get_authtok_nopasswd(pamh, argc, argv, &p, &retval)) {
++		retval = verify_with_fprintd(pamh, &p, &should_verify);
++	}
++
+ 	if (retval != PAM_SUCCESS) {
+ 		if (retval != PAM_CONV_AGAIN) {
+ 			pam_syslog(pamh, LOG_CRIT,
+@@ -173,8 +178,11 @@
+ 	}
+ 	D(("user=%s, password=[%s]", name, p));
+ 
+-	/* verify the password of this user */
+-	retval = _unix_verify_password(pamh, name, p, ctrl);
++	if (should_verify)
++	{
++		/* verify the password of this user */
++		retval = _unix_verify_password(pamh, name, p, ctrl);
++	}
+ 	name = p = NULL;
+ 
+ 	AUTH_RETURN;

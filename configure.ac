@@ -11,30 +11,6 @@ m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 AC_SUBST(PACKAGE)
 AC_SUBST(VERSION)
 
-AC_PREFIX_DEFAULT(/usr)
-
-test "${prefix}" = "NONE" && prefix="/usr"
-if test ${prefix} = '/usr'
-then
-	if test ${sysconfdir} = '${prefix}/etc'
-	then
-		sysconfdir="/etc"
-	fi
-	if test ${libdir} = '${exec_prefix}/lib'
-	then
-		case "$host_cpu" in
-			x86_64|ppc64|s390x|sparc64)
-				libdir="/lib64" ;;
-			*)
-				libdir="/lib" ;;
-		esac
-	fi
-	if test ${sbindir} = '${exec_prefix}/sbin'
-	then
-		sbindir="/sbin"
-	fi
-fi
-
 AC_USE_SYSTEM_EXTENSIONS
 
 LT_INIT([disable-static])

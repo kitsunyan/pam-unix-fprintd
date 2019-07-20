@@ -1,1 +1,1 @@
-extern char *bigcrypt(const char *key, const char *salt);
+../linux-pam/modules/pam_unix/bigcrypt.h
